@@ -1,6 +1,7 @@
 """Interfaces with Alarm.com alarm control panels."""
 import logging
 import re
+from custom_components.alarmdotcom.lock import AlarmDotComLock
 
 from pyalarmdotcomajax import Alarmdotcom, AlarmdotcomADT, AlarmdotcomProtection1
 import voluptuous as vol
@@ -27,6 +28,7 @@ from homeassistant.const import (
     STATE_ALARM_ARMED_HOME,
     STATE_ALARM_ARMED_NIGHT,
     STATE_ALARM_DISARMED,
+    STATE_UNAVAILABLE,
 )
 from homeassistant.helpers.aiohttp_client import (
     async_create_clientsession,
@@ -50,6 +52,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Required(CONF_PASSWORD): cv.string,
         vol.Required(CONF_USERNAME): cv.string,
         vol.Optional(CONF_CODE): cv.string,
+        vol.Optional("lock_code"): cv.string,
         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
         vol.Optional(CONF_FORCE_BYPASS, default="false"): cv.string,
         vol.Optional(CONF_NO_ENTRY_DELAY, default="false"): cv.string,
@@ -65,6 +68,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     """Set up a Alarm.com control panel."""
     name = config.get(CONF_NAME)
     code = config.get(CONF_CODE)
+    lock_code = config.get("lock_code")
     username = config.get(CONF_USERNAME)
     password = config.get(CONF_PASSWORD)
     force_bypass = config.get(CONF_FORCE_BYPASS)
@@ -80,21 +84,60 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     if not use_new_websession:
         hass.data[DOMAIN] = True
         use_new_websession = False
-    alarmdotcom = AlarmDotCom(
-        hass,
-        name,
-        code,
+
+    if use_new_websession:
+        websession = async_create_clientsession(hass)
+        _LOGGER.debug("Using new websession.")
+    else:
+        websession = async_get_clientsession(hass)
+        _LOGGER.debug("Using hass websession.")
+    
+    no_entry_delay = (
+        "stay" if no_entry_delay.lower() == "home" else no_entry_delay.lower()
+    )
+    
+    force_bypass = (
+        "stay" if force_bypass.lower() == "home" else force_bypass.lower()
+    )
+    
+    silent_arming = (
+        "stay" if silent_arming.lower() == "home" else silent_arming.lower()
+    )
+    
+    if adt_or_protection1 == 1:
+        adc_class = AlarmdotcomADT
+    elif adt_or_protection1 == 2:
+        adc_class = AlarmdotcomProtection1
+    else:
+        adc_class = Alarmdotcom
+    alarmdotcom = adc_class(
         username,
         password,
+        websession,
         force_bypass,
         no_entry_delay,
         silent_arming,
-        use_new_websession,
-        adt_or_protection1,
         two_factor_cookie,
     )
+
     await alarmdotcom.async_login()
-    async_add_entities([alarmdotcom])
+
+    entitites = []
+    entitites += AlarmDotCom(
+        name,
+        code,
+        alarmdotcom
+    )
+
+    for lock_id in alarmdotcom.lock_ids:
+        entitites += AlarmDotComLock(
+            lock_id,
+            name,
+            lock_code,
+            alarmdotcom
+        )
+
+    async_add_entities(entitites)
 
 
 class AlarmDotCom(AlarmControlPanelEntity):
@@ -102,58 +145,17 @@ class AlarmDotCom(AlarmControlPanelEntity):
 
     def __init__(
         self,
-        hass,
         name,
         code,
-        username,
-        password,
-        force_bypass,
-        no_entry_delay,
-        silent_arming,
-        use_new_websession,
-        adt_or_protection1,
-        two_factor_cookie,
+        alarm
     ):
         """Initialize the Alarm.com status."""
 
         _LOGGER.debug("Setting up Alarm.com...")
         self._name = name
         self._code = code if code else None
-        if use_new_websession:
-            websession = async_create_clientsession(hass)
-            _LOGGER.debug("Using new websession.")
-        else:
-            websession = async_get_clientsession(hass)
-            _LOGGER.debug("Using hass websession.")
+        self._alarm = alarm
         self._state = None
-        no_entry_delay = (
-            "stay" if no_entry_delay.lower() == "home" else no_entry_delay.lower()
-        )
-        force_bypass = (
-            "stay" if force_bypass.lower() == "home" else force_bypass.lower()
-        )
-        silent_arming = (
-            "stay" if silent_arming.lower() == "home" else silent_arming.lower()
-        )
-        if adt_or_protection1 == 1:
-            adc_class = AlarmdotcomADT
-        elif adt_or_protection1 == 2:
-            adc_class = AlarmdotcomProtection1
-        else:
-            adc_class = Alarmdotcom
-        self._alarm = adc_class(
-            username,
-            password,
-            websession,
-            force_bypass,
-            no_entry_delay,
-            silent_arming,
-            two_factor_cookie,
-        )
-
-    async def async_login(self):
-        """Login to Alarm.com."""
-        await self._alarm.async_login()
 
     async def async_update(self):
         """Fetch the latest state."""
@@ -164,6 +166,11 @@ class AlarmDotCom(AlarmControlPanelEntity):
     def name(self):
         """Return the name of the alarm."""
         return self._name
+
+    @property
+    def unique_id(self) -> str:
+        """Return the unique ID of the sensor."""
+        return self._alarm.partitionid
 
     @property
     def code_format(self):
@@ -185,7 +192,7 @@ class AlarmDotCom(AlarmControlPanelEntity):
             return STATE_ALARM_ARMED_AWAY
         if self._alarm.state.lower() == "armed night":
             return STATE_ALARM_ARMED_NIGHT
-        return None
+        return STATE_UNAVAILABLE
 
     @property
     def supported_features(self) -> int:
